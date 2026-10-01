@@ -1,0 +1,20 @@
+{
+  "name": "extrabot-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "migrate": "node --env-file-if-exists=.env scripts/migrate.js",
+    "demo": "node --env-file-if-exists=.env scripts/demo.js",
+    "start": "node --env-file-if-exists=.env scripts/slack.js",
+    "check:slack-config": "node --env-file-if-exists=.env scripts/check-slack-config.js",
+    "check:slack-auth": "node --env-file-if-exists=.env scripts/check-slack-auth.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@slack/bolt": "^5.1.0"
+  }
+}
