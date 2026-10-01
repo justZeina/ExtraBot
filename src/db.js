@@ -99,4 +99,22 @@ export function migrate(db) {
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=5').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`ALTER TABLE notification_outbox ADD COLUMN claim_token TEXT;
+        ALTER TABLE notification_outbox ADD COLUMN claimed_at TEXT;
+        CREATE TABLE request_message_cards (
+          request_id INTEGER NOT NULL REFERENCES extra_requests(id),
+          recipient_slack_user_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          message_ts TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(request_id, recipient_slack_user_id, kind)
+        );`);
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 }

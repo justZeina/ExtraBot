@@ -195,17 +195,37 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
     buttons.push(action('Approve', 'extra_open_form', id, { kind: 'ceo_decision', decision: 'APPROVE', approvalId: summary.latestApproval.id }, 'primary'));
     buttons.push(action('Reject', 'extra_open_form', id, { kind: 'ceo_decision', decision: 'REJECT', approvalId: summary.latestApproval.id }, 'danger'));
   }
-  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(buttons)];
+  const uniqueButtons = buttons.map((element, index) => ({ ...element, action_id: `${element.action_id}:${index}` }));
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(uniqueButtons)];
   return { text: `Extra #${id}: ${summary.title} — ${summary.status}`, blocks };
 }
 
 export function requestView(summary, actor, ceoId, configuredDepartments) {
-  let actionIndex = 0;
-  const blocks = summaryMessage(summary, actor, ceoId, configuredDepartments).blocks.map(block =>
-    block.type === 'actions' ? { ...block, elements: block.elements.map(element =>
-      ({ ...element, action_id: `${element.action_id}:${actionIndex++}` })) } : block);
+  const blocks = summaryMessage(summary, actor, ceoId, configuredDepartments).blocks;
   return { type: 'modal', callback_id: 'extra_request', title: plain(`Extra #${summary.id}`.slice(0, 24)),
     close: plain('Close'), blocks };
+}
+
+export function createdView(summary) {
+  return { type: 'modal', callback_id: 'extra_created', title: plain(`Extra #${summary.id}`.slice(0, 24)),
+    close: plain('Done'), blocks: [{ type: 'section', text: { type: 'mrkdwn', text:
+      `*Extra #${summary.id} sent*\n${clipped(summary.title, 180)}\nAssigned teams have been asked for effort estimates.` } }] };
+}
+
+export function progressMessage(summary) {
+  const lines = [`*Extra #${summary.id} · ${clipped(summary.title, 180)}*`,
+    `*Client:* ${clipped(summary.client || '—', 120)}`, `*Status:* ${statusLabel(summary.status)}`];
+  if (['COLLECTING_EFFORT', 'REVIEWING_EFFORT', 'AWAITING_CEO', 'CEO_REJECTED', 'CEO_CHANGES_REQUESTED'].includes(summary.status)
+    || summary.delivery_round === 0) {
+    lines.push(`*Effort round ${summary.effort_round}*`);
+    for (const d of summary.departments) lines.push(`• ${clipped(d.department_key)} <@${d.assignee_slack_user_id}>: ${d.effort_minutes == null ? 'pending' : `${d.effort_input_value} ${d.effort_input_unit}`}`);
+  } else {
+    lines.push(`*Delivery round ${summary.delivery_round}*`);
+    for (const d of summary.departments) lines.push(`• ${clipped(d.department_key)} <@${d.assignee_slack_user_id}>: ${d.estimated_delivery_at ? formatCairo(d.estimated_delivery_at) : 'pending'}`);
+  }
+  return { text: `Extra #${summary.id} progress: ${statusLabel(summary.status)}`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } },
+      { type: 'actions', elements: [button('View current request', 'extra_view', { requestId: summary.id })] }] };
 }
 
 const eventTitles = {
@@ -229,7 +249,8 @@ export function notificationMessage(notification, summary) {
     `*${eventTitles[event] || event}*`, `*Title:* ${clipped(summary.title, 150)}`,
     `*Client:* ${clipped(summary.client || '—', 120)}`, `*Description:* ${clipped(summary.description, 500)}`,
     `*Requested by:* <@${summary.marketer_slack_user_id}>`, `*Status:* ${statusLabel(summary.status)}`];
-  if (p.department) lines.push(`Department: ${clipped(p.department, 80)}`);
+  const assignedDepartments = p.departments?.length ? p.departments : p.department ? [p.department] : [];
+  if (assignedDepartments.length) lines.push(`Department${assignedDepartments.length === 1 ? '' : 's'}: ${assignedDepartments.map(d => clipped(d, 80)).join(', ')}`);
   if (p.assigneeId) lines.push(`Submitted by: <@${p.assigneeId}>`);
   if (p.effortValue != null) lines.push(`*Effort:* ${p.effortValue} ${p.effortUnit}`);
   if (p.deliveryAt) lines.push(`*Delivery date:* ${formatCairo(p.deliveryAt)}`);
@@ -258,11 +279,11 @@ export function notificationMessage(notification, summary) {
   const actions = [];
   const id = summary.id;
   if (['EFFORT_REQUESTED', 'EFFORT_REREQUESTED', 'EFFORT_REMINDER'].includes(event)) {
-    actions.push(action('Submit effort', 'extra_open_form:0', id, { kind: 'effort', department: p.department,
-      round, roundType: 'effort' }, 'primary'));
+    assignedDepartments.forEach((department, index) => actions.push(action(`Submit ${department} effort`, `extra_open_form:${index}`, id,
+      { kind: 'effort', department, round, roundType: 'effort' }, 'primary')));
   } else if (['CONTENT_DELIVERY_REQUESTED', 'OTHER_DELIVERY_REQUESTED', 'DELIVERY_REREQUESTED'].includes(event)) {
-    actions.push(action('Submit delivery date', 'extra_open_form:0', id, { kind: 'delivery', department: p.department,
-      round, roundType: 'delivery' }, 'primary'));
+    assignedDepartments.forEach((department, index) => actions.push(action(`Submit ${department} date`, `extra_open_form:${index}`, id,
+      { kind: 'delivery', department, round, roundType: 'delivery' }, 'primary')));
   } else if (event === 'ALL_EFFORTS_COLLECTED') {
     actions.push(action('Send to CEO', 'extra_lock', id, { round, roundType: 'effort' }, 'primary'));
     actions.push(action('Re-request estimates', 'extra_open_form:0', id, { kind: 'rerequest_effort', round, roundType: 'effort' }));

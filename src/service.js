@@ -64,6 +64,17 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     run('INSERT OR IGNORE INTO notification_outbox(request_id,event_type,recipient_slack_user_id,payload_json,available_at,created_at,dedupe_key) VALUES(?,?,?,?,?,?,?)',
       reqId, type, recipient, json({ requestId: reqId, recipientId: recipient, ...payload }), t, t, key);
   }
+  function notifyAssignments(reqId, type, teamRows, payload, keyPrefix) {
+    const byRecipient = new Map();
+    for (const d of teamRows) {
+      const names = byRecipient.get(d.assignee_slack_user_id) ?? [];
+      names.push(d.department_key);
+      byRecipient.set(d.assignee_slack_user_id, names);
+    }
+    for (const [recipient, names] of byRecipient) {
+      notify(reqId, type, recipient, { ...payload, departments: names, department: names[0] }, `${keyPrefix}:${recipient}`);
+    }
+  }
   function pending(reqId, kind) {
     return one("SELECT COUNT(*) AS n FROM proposals WHERE request_id=? AND status='PENDING' AND kind=?", reqId, kind).n;
   }
@@ -159,10 +170,10 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       const t = stamp();
       const id = Number(run('INSERT INTO extra_requests(client,title,description,marketer_slack_user_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)', client, title, description, actor, 'COLLECTING_EFFORT', t, t).lastInsertRowid);
       for (const item of normalized) {
-        const deptId = Number(run('INSERT INTO request_departments(request_id,department_key,assignee_slack_user_id) VALUES(?,?,?)', id, item.department, item.assigneeId).lastInsertRowid);
-        scheduleReminder(id, { id: deptId }, t);
-        notify(id, 'EFFORT_REQUESTED', item.assigneeId, { department: item.department, title, round: 1 }, `effort-request:${id}:${deptId}:1`);
+        const departmentId = Number(run('INSERT INTO request_departments(request_id,department_key,assignee_slack_user_id) VALUES(?,?,?)', id, item.department, item.assigneeId).lastInsertRowid);
+        scheduleReminder(id, { id: departmentId }, t);
       }
+      notifyAssignments(id, 'EFFORT_REQUESTED', departments(id), { title, round: 1 }, `effort-request:${id}:1`);
       audit(id, actor, 'REQUEST_CREATED', null, { client, title, description, departments: normalized });
       return getRequestSummary(id);
     });
@@ -242,9 +253,8 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
         cancelReminders(d.id);
         run('UPDATE request_departments SET effort_minutes=NULL,effort_input_value=NULL,effort_input_unit=NULL,effort_note=NULL,effort_submitted_at=NULL WHERE id=?', d.id);
         scheduleReminder(req.id, d, stamp());
-        notify(req.id, 'EFFORT_REREQUESTED', d.assignee_slack_user_id,
-          { department: d.department_key, round, note }, `effort-rerequest:${req.id}:${d.id}:${round}`);
       }
+      notifyAssignments(req.id, 'EFFORT_REREQUESTED', chosen, { round, note }, `effort-rerequest:${req.id}:${round}`);
       setState(req, 'COLLECTING_EFFORT', actor, note);
       audit(req.id, actor, 'EFFORT_REREQUESTED', null, { departments: chosen.map(d => d.department_key), round, note }, note);
       return { requestId, departments: chosen.map(d => d.department_key), round };
@@ -392,10 +402,9 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       setState(req, 'COLLECTING_DELIVERY', actor, note);
       const allDepartments = departments(req.id);
       const content = allDepartments.find(d => d.department_key.toLowerCase() === 'content');
-      for (const d of content ? [content] : allDepartments) {
-        notify(req.id, content ? 'CONTENT_DELIVERY_REQUESTED' : 'OTHER_DELIVERY_REQUESTED', d.assignee_slack_user_id,
-          { department: d.department_key, contentDeliveryAt: null, note, round }, `delivery-request:${req.id}:${d.id}:${round}`);
-      }
+      notifyAssignments(req.id, content ? 'CONTENT_DELIVERY_REQUESTED' : 'OTHER_DELIVERY_REQUESTED',
+        content ? [content] : allDepartments, { contentDeliveryAt: null, note, round },
+        `delivery-request:${req.id}:${round}:${content ? 'content' : 'others'}`);
       audit(req.id, actor, 'DELIVERY_TIMES_REQUESTED', null, { round, note }, note);
       return { requestId, round };
     });
@@ -420,12 +429,10 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
         run('UPDATE request_departments SET estimated_delivery_at=NULL,delivery_note=NULL,delivery_submitted_at=NULL WHERE id=?', d.id);
       }
       setState(req, 'COLLECTING_DELIVERY', actor, note);
-      for (const d of chosen) {
-        if (content && selectedIds.has(content.id) && d.id !== content.id) continue;
-        notify(req.id, 'DELIVERY_REREQUESTED', d.assignee_slack_user_id,
-          { department: d.department_key, contentDeliveryAt: d.id === content?.id ? null : content?.estimated_delivery_at ?? null, note, round },
-          `delivery-rerequest:${req.id}:${d.id}:${round}`);
-      }
+      notifyAssignments(req.id, 'DELIVERY_REREQUESTED',
+        content && selectedIds.has(content.id) ? [content] : chosen,
+        { contentDeliveryAt: content && !selectedIds.has(content.id) ? content.estimated_delivery_at : null, note, round },
+        `delivery-rerequest:${req.id}:${round}`);
       audit(req.id, actor, 'DELIVERY_REREQUESTED', null, { departments: chosen.map(d => d.department_key), round, note }, note);
       return { requestId, departments: chosen.map(d => d.department_key), round };
     });
@@ -448,10 +455,10 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
           pendingDepartments: departments(req.id).filter(x => x.estimated_delivery_at == null).map(x => ({ department: x.department_key, assigneeId: x.assignee_slack_user_id })) },
         `delivery-submitted:${req.id}:${d.id}:${req.version + 1}`);
       if (content?.id === d.id && !d.estimated_delivery_at) {
-        for (const other of departments(req.id).filter(x => x.id !== d.id && !x.estimated_delivery_at)) notify(req.id,
-          req.delivery_round > 1 ? 'DELIVERY_REREQUESTED' : 'OTHER_DELIVERY_REQUESTED', other.assignee_slack_user_id,
-          { department: other.department_key, contentDeliveryAt: date, note: req.delivery_request_note, round: req.delivery_round },
-          `delivery-request:${req.id}:${other.id}:${req.delivery_round}`);
+        notifyAssignments(req.id, req.delivery_round > 1 ? 'DELIVERY_REREQUESTED' : 'OTHER_DELIVERY_REQUESTED',
+          departments(req.id).filter(x => x.id !== d.id && !x.estimated_delivery_at),
+          { contentDeliveryAt: date, note: req.delivery_request_note, round: req.delivery_round },
+          `delivery-request:${req.id}:${req.delivery_round}:others`);
       }
       nextDeliveryState(req, actor);
       return { requestId, department: key, deliveryAt: date };
@@ -523,20 +530,49 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
   }
   function getPendingNotifications(limit = 100) {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) fail('VALIDATION_ERROR', 'limit must be 1 to 1000');
-    return all("SELECT * FROM notification_outbox WHERE status IN ('PENDING','FAILED') AND available_at<=? ORDER BY id LIMIT ?", stamp(), limit)
+    const nowAt = stamp();
+    const expiredAt = new Date(new Date(nowAt).getTime() - 120_000).toISOString();
+    return all("SELECT * FROM notification_outbox WHERE status IN ('PENDING','FAILED') AND available_at<=? AND (claim_token IS NULL OR claimed_at<=?) ORDER BY id LIMIT ?", nowAt, expiredAt, limit)
       .map(x => ({ ...x, payload: JSON.parse(x.payload_json) }));
   }
-  function markNotification(id, status) {
+  function claimNotification(id, token) {
+    const claim = requireText(token, 'token');
+    return transaction(() => {
+      const nowAt = stamp();
+      const expiredAt = new Date(new Date(nowAt).getTime() - 120_000).toISOString();
+      return run("UPDATE notification_outbox SET claim_token=?,claimed_at=? WHERE id=? AND status IN ('PENDING','FAILED') AND available_at<=? AND (claim_token IS NULL OR claimed_at<=?)",
+        claim, nowAt, id, nowAt, expiredAt).changes === 1;
+    });
+  }
+  function markNotification(id, status, claimToken = null) {
     if (!['SENT', 'FAILED'].includes(status)) fail('VALIDATION_ERROR', 'notification status must be SENT or FAILED');
     return transaction(() => {
       const row = one('SELECT * FROM notification_outbox WHERE id=?', id);
       if (!row) fail('NOT_FOUND', 'notification not found');
       if (row.status === 'SENT') return { id, status: 'SENT' };
+      if (claimToken != null && row.claim_token !== claimToken) fail('STALE_VERSION', 'notification claim is no longer owned');
       const retryDelayMs = Math.min(2 ** Math.min(row.attempt_count, 8) * 5_000, 15 * 60_000);
       const nextAvailable = status === 'FAILED' ? new Date(new Date(stamp()).getTime() + retryDelayMs).toISOString() : row.available_at;
-      run('UPDATE notification_outbox SET status=?,attempt_count=attempt_count+1,sent_at=?,available_at=? WHERE id=?',
+      run('UPDATE notification_outbox SET status=?,attempt_count=attempt_count+1,sent_at=?,available_at=?,claim_token=NULL,claimed_at=NULL WHERE id=?',
         status, status === 'SENT' ? stamp() : null, nextAvailable, id);
       return { id, status };
+    });
+  }
+  function getMessageCard(requestId, recipientId, kind) {
+    return one('SELECT * FROM request_message_cards WHERE request_id=? AND recipient_slack_user_id=? AND kind=?',
+      requestId, requireText(recipientId, 'recipientId'), requireText(kind, 'kind')) ?? null;
+  }
+  function saveMessageCard({ requestId, recipientId, kind, channelId, messageTs }) {
+    const recipient = requireText(recipientId, 'recipientId');
+    const cardKind = requireText(kind, 'kind');
+    const channel = requireText(channelId, 'channelId');
+    const ts = requireText(messageTs, 'messageTs');
+    return transaction(() => {
+      run(`INSERT INTO request_message_cards(request_id,recipient_slack_user_id,kind,channel_id,message_ts,updated_at)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(request_id,recipient_slack_user_id,kind)
+        DO UPDATE SET channel_id=excluded.channel_id,message_ts=excluded.message_ts,updated_at=excluded.updated_at`,
+      requestId, recipient, cardKind, channel, ts, stamp());
+      return { requestId, recipientId: recipient, kind: cardKind, channelId: channel, messageTs: ts };
     });
   }
   return {
@@ -550,6 +586,6 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     proposeDeliveryChange: (input, actor) => propose('DELIVERY', input, actor),
     respondToDeliveryProposal: (input, actor) => respond('DELIVERY', input, actor),
     approveFinalDelivery, getRequestSummary, getRequestHistory, listRequestsForActor, processDueReminders,
-    getPendingNotifications, markNotification
+    getPendingNotifications, claimNotification, markNotification, getMessageCard, saveMessageCard
   };
 }

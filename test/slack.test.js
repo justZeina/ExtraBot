@@ -16,9 +16,11 @@ function fakeApp() {
   const openedViews = [];
   const pushedViews = [];
   const updatedViews = [];
+  const updatedMessages = [];
   const client = {
     conversations: { open: async ({ users }) => ({ channel: { id: `D_${users}` } }) },
-    chat: { postMessage: async message => { sent.push(message); return { ok: true }; } },
+    chat: { postMessage: async message => { sent.push(message); return { ok: true, channel: message.channel, ts: String(sent.length) }; },
+      update: async message => { updatedMessages.push(message); return { ok: true }; } },
     views: { open: async payload => { openedViews.push(payload); return { ok: true }; },
       push: async payload => { pushedViews.push(payload); return { ok: true }; },
       update: async payload => { updatedViews.push(payload); return { ok: true }; } }
@@ -28,7 +30,7 @@ function fakeApp() {
     assert.ok(route, `No action handler for ${actionId}`);
     return route.fn(payload);
   };
-  return { app, handlers, client, sent, openedViews, pushedViews, updatedViews, invokeAction };
+  return { app, handlers, client, sent, updatedMessages, openedViews, pushedViews, updatedViews, invokeAction };
 }
 const ack = () => async value => { ack.last = value; };
 
@@ -50,7 +52,9 @@ test('Slack form creates request and sends assignee notifications', async () => 
     }, ack: ack(), client: f.client });
     assert.equal(service.getRequestSummary(1).departments.length, 3);
     assert.equal(service.getRequestSummary(1).client, 'Acme');
-    assert.ok(f.sent.some(x => x.channel === 'D_MARKETER' && x.blocks[0].text.text.includes('was sent')));
+    assert.equal(f.sent.filter(x => x.channel === 'D_MARKETER').length, 0);
+    assert.equal(ack.last.response_action, 'update');
+    assert.equal(ack.last.view.callback_id, 'extra_created');
     assert.ok(f.sent.some(x => x.channel === 'D_CONTENT'));
     assert.ok(f.sent.some(x => x.channel === 'D_ART'));
     assert.ok(f.sent.some(x => x.channel === 'D_STORY'));
@@ -193,6 +197,66 @@ test('stage notifications show pending teams and the next two decisions', () => 
     assert.ok(message.blocks[0].text.text.includes('Reduce scope'));
     assert.deepEqual(message.blocks.flatMap(b => b.elements || []).map(x => x.text.text),
       ['Re-request estimates', 'Dismiss permanently']);
+  } finally { service.close(); }
+});
+
+test('one assignee gets one actionable message for multiple departments', async () => {
+  const service = createExtraService({ ceoSlackUserId: 'CEO', workingWeekdays: [0, 1, 2, 3, 4] });
+  const f = fakeApp();
+  const worker = createOutboxWorker({ service, client: f.client, ceoSlackUserId: 'CEO' });
+  try {
+    const id = service.createRequest({ client: 'Acme', title: 'Campaign', description: 'Assets', departments: [
+      { department: 'Content', assigneeId: 'SAME' }, { department: 'Art', assigneeId: 'SAME' }
+    ] }, 'MARKETER').id;
+    const notices = service.getPendingNotifications().filter(n => n.event_type === 'EFFORT_REQUESTED');
+    assert.equal(notices.length, 1);
+    assert.deepEqual(notices[0].payload.departments, ['Content', 'Art']);
+    const actions = notificationMessage(notices[0], service.getRequestSummary(id)).blocks.flatMap(b => b.elements || []);
+    assert.deepEqual(actions.slice(0, 2).map(a => a.text.text), ['Submit Content effort', 'Submit Art effort']);
+    assert.equal(new Set(actions.map(a => a.action_id)).size, actions.length);
+    await worker.flush();
+    assert.equal(f.sent.filter(m => m.channel === 'D_SAME').length, 1);
+  } finally { service.close(); }
+});
+
+test('team submissions update one marketer progress card', async () => {
+  const service = createExtraService({ ceoSlackUserId: 'CEO', workingWeekdays: [0, 1, 2, 3, 4] });
+  const f = fakeApp();
+  const worker = createOutboxWorker({ service, client: f.client, ceoSlackUserId: 'CEO' });
+  try {
+    const id = service.createRequest({ client: 'Acme', title: 'Campaign', description: 'Assets', departments: [
+      { department: 'Content', assigneeId: 'CONTENT' }, { department: 'Art', assigneeId: 'ART' }
+    ] }, 'MARKETER').id;
+    await worker.flush();
+    const version = () => service.getRequestSummary(id).version;
+    service.submitEffort({ requestId: id, department: 'Content', effort: { value: 2, unit: 'hours' }, expectedVersion: version() }, 'CONTENT');
+    await worker.flush();
+    assert.equal(f.sent.filter(m => m.channel === 'D_MARKETER').length, 1);
+    assert.ok(f.sent.find(m => m.channel === 'D_MARKETER').blocks[0].text.text.includes('Art <@ART>: pending'));
+    const card = service.getMessageCard(id, 'MARKETER', 'MARKETER_PROGRESS');
+    assert.equal(card.channel_id, 'D_MARKETER');
+    service.submitEffort({ requestId: id, department: 'Art', effort: { value: 3, unit: 'hours' }, expectedVersion: version() }, 'ART');
+    await worker.flush();
+    assert.equal(f.updatedMessages.filter(m => m.channel === card.channel_id && m.ts === card.message_ts).length, 1);
+    assert.equal(f.sent.filter(m => m.channel === 'D_MARKETER').length, 2);
+    assert.ok(f.sent.find(m => m.channel === 'D_MARKETER' && m.text.includes('All effort estimates')));
+  } finally { service.close(); }
+});
+
+test('outbox claim prevents a second worker from sending the same notification', async () => {
+  const service = createExtraService({ ceoSlackUserId: 'CEO', workingWeekdays: [0, 1, 2, 3, 4] });
+  const f = fakeApp();
+  const worker = createOutboxWorker({ service, client: f.client, ceoSlackUserId: 'CEO' });
+  try {
+    service.createRequest({ client: 'Acme', title: 'Campaign', description: 'Assets', departments: [
+      { department: 'Art', assigneeId: 'ART' }
+    ] }, 'MARKETER');
+    const notice = service.getPendingNotifications()[0];
+    assert.equal(service.claimNotification(notice.id, 'first'), true);
+    assert.equal(service.claimNotification(notice.id, 'second'), false);
+    await worker.flush();
+    assert.equal(f.sent.length, 0);
+    service.markNotification(notice.id, 'FAILED', 'first');
   } finally { service.close(); }
 });
 
