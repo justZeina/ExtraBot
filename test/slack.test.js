@@ -123,10 +123,11 @@ test('notification button opens an actionable request modal and effort form', as
     assert.equal(f.updatedViews[0].view.callback_id, 'extra_form');
     let formAck;
     await f.handlers.view.extra_form({ body: { user: { id: 'ART' } }, view: { private_metadata: f.updatedViews[0].view.private_metadata,
-      blocks: f.updatedViews[0].view.blocks, state: { values: { amount: { value: { value: '2h' } },
+      blocks: f.updatedViews[0].view.blocks, state: { values: { amount: { value: { value: 'Around two days, depending on assets' } },
         note: { value: { value: 'Draft plus review' } } } } },
       ack: async value => { formAck = value; }, client: f.client });
-    assert.equal(service.getRequestSummary(id).departments[0].effort_minutes, 120);
+    assert.equal(service.getRequestSummary(id).departments[0].effort_text, 'Around two days, depending on assets');
+    assert.equal(service.getRequestSummary(id).departments[0].effort_minutes, null);
     assert.equal(service.getRequestSummary(id).departments[0].effort_note, 'Draft plus review');
     assert.equal(formAck.response_action, 'update');
     assert.equal(formAck.view.callback_id, 'extra_request');
@@ -216,6 +217,26 @@ test('one assignee gets one actionable message for multiple departments', async 
     assert.equal(new Set(actions.map(a => a.action_id)).size, actions.length);
     await worker.flush();
     assert.equal(f.sent.filter(m => m.channel === 'D_SAME').length, 1);
+  } finally { service.close(); }
+});
+
+test('free-text estimates complete the round and reach the CEO unchanged', () => {
+  const service = createExtraService({ ceoSlackUserId: 'CEO', workingWeekdays: [0, 1, 2, 3, 4] });
+  try {
+    const id = service.createRequest({ client: 'Acme', title: 'Campaign', description: 'Assets', departments: [
+      { department: 'Content', assigneeId: 'CONTENT' }, { department: 'Art', assigneeId: 'ART' }
+    ] }, 'MARKETER').id;
+    const version = () => service.getRequestSummary(id).version;
+    service.submitEffort({ requestId: id, department: 'Content', effort: 'Maybe 1–2 days / depends on the brief', expectedVersion: version() }, 'CONTENT');
+    assert.equal(service.getRequestSummary(id).status, 'COLLECTING_EFFORT');
+    service.submitEffort({ requestId: id, department: 'Art', effort: 'TBD after storyboard', expectedVersion: version() }, 'ART');
+    assert.equal(service.getRequestSummary(id).status, 'REVIEWING_EFFORT');
+    const ready = service.getPendingNotifications().find(n => n.event_type === 'ALL_EFFORTS_COLLECTED');
+    assert.ok(notificationMessage(ready, service.getRequestSummary(id)).blocks[0].text.text.includes('TBD after storyboard'));
+    const approval = service.lockAndRequestCeoApproval({ requestId: id, expectedVersion: version() }, 'MARKETER');
+    assert.ok(approval.approvalId);
+    const ceo = service.getPendingNotifications().find(n => n.event_type === 'CEO_APPROVAL_REQUESTED');
+    assert.ok(notificationMessage(ceo, service.getRequestSummary(id)).blocks[0].text.text.includes('Maybe 1–2 days / depends on the brief'));
   } finally { service.close(); }
 });
 

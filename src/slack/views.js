@@ -3,6 +3,9 @@ import { formatCairo } from '../time.js';
 const plain = text => ({ type: 'plain_text', text: String(text) });
 const escape = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const clipped = (value, max = 2500) => escape(String(value ?? '')).slice(0, max);
+const hasEffort = department => department.effort_submitted_at != null;
+const effortText = department => department.effort_text ?? (department.effort_input_value == null
+  ? 'pending' : `${department.effort_input_value} ${department.effort_input_unit}`);
 const input = (id, label, element, optional = false) => ({ type: 'input', block_id: id, label: plain(label), element: { ...element, action_id: 'value' }, optional });
 const textInput = (id, label, initial = undefined, multiline = false, optional = false) => input(id, label,
   { type: 'plain_text_input', ...(initial != null ? { initial_value: String(initial) } : {}), multiline }, optional);
@@ -49,8 +52,9 @@ export function formView(kind, context, summary, departments) {
     `*${clipped(summary.title, 150)}*\n*Client:* ${clipped(summary.client || '—', 100)}\n*Description:* ${clipped(summary.description, 1000)}\n*Requested by:* <@${summary.marketer_slack_user_id}>` } });
   if (kind === 'effort') {
     blocks.push(details());
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*${clipped(department)} effort request · round ${summary.effort_round}*\nEnter hours as 3h, days as 2d, or weeks as 1w. A number alone means hours.` }] });
-    blocks.push(textInput('amount', 'Effort estimate'));
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*${clipped(department)} effort request · round ${summary.effort_round}*` }] });
+    const existing = summary.departments.find(d => d.department_key === department);
+    blocks.push(textInput('amount', 'Effort estimate', existing && hasEffort(existing) ? effortText(existing) : undefined, true));
     blocks.push(textInput('note', 'Optional Note', undefined, true, true));
   } else if (['propose_effort', 'counter_effort'].includes(kind)) {
     blocks.push(textInput('amount', 'Effort amount, e.g. 2.5'));
@@ -78,7 +82,7 @@ export function formView(kind, context, summary, departments) {
   } else if (kind === 'ceo_decision') {
     blocks.push(details());
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: summary.departments.map(d =>
-      `• *${clipped(d.department_key)}:* ${d.effort_input_value} ${d.effort_input_unit}${d.effort_note ? ` · ${clipped(d.effort_note, 180)}` : ''}`).join('\n') } });
+      `• *${clipped(d.department_key)}:* ${clipped(effortText(d), 300)}${d.effort_note ? ` · ${clipped(d.effort_note, 180)}` : ''}`).join('\n') } });
     blocks.push(textInput('note', 'Optional Note', undefined, true, true));
   } else if (kind === 'delivery_request') {
     blocks.push(details());
@@ -128,7 +132,7 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
     `*Status:* ${statusLabel(summary.status)} · *Effort round:* ${summary.effort_round} · *Delivery round:* ${summary.delivery_round}`];
   const contentDelivery = summary.departments.find(d => d.department_key.toLowerCase() === 'content')?.estimated_delivery_at;
   for (const d of summary.departments) {
-    const effort = d.effort_minutes == null ? 'pending effort' : `${d.effort_input_value} ${d.effort_input_unit} (${d.effort_minutes} min)`;
+    const effort = hasEffort(d) ? clipped(effortText(d), 300) : 'pending effort';
     const delivery = d.estimated_delivery_at ? (contentDelivery && d.department_key.toLowerCase() !== 'content'
       ? ` · delivery window ${formatCairo(contentDelivery)} → ${formatCairo(d.estimated_delivery_at)}`
       : ` · delivery ${formatCairo(d.estimated_delivery_at)}`) : '';
@@ -161,7 +165,7 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
   }
   for (const d of summary.departments) {
     const own = d.assignee_slack_user_id === actor;
-    if (own && summary.status === 'COLLECTING_EFFORT') buttons.push(action(`${d.effort_minutes == null ? 'Submit' : 'Update'} effort: ${d.department_key}`,
+    if (own && summary.status === 'COLLECTING_EFFORT') buttons.push(action(`${hasEffort(d) ? 'Update' : 'Submit'} effort: ${d.department_key}`,
       'extra_open_form', id, { kind: 'effort', department: d.department_key }));
     if (own && deliveryOpen && (d.department_key.toLowerCase() === 'content' || !summary.departments.some(x => x.department_key.toLowerCase() === 'content' && !x.estimated_delivery_at))) {
       buttons.push(action(`Delivery: ${d.department_key}`, 'extra_open_form', id, { kind: 'delivery', department: d.department_key }));
@@ -175,7 +179,7 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
         { kind: p.kind === 'EFFORT' ? 'counter_effort' : 'counter_delivery', proposalId: p.id, department: d.department_key }));
     }
   }
-  if (marketer && effortOpen && summary.departments.every(d => d.effort_minutes != null) && !summary.pendingProposals.some(p => p.kind === 'EFFORT')) {
+  if (marketer && effortOpen && summary.departments.every(hasEffort) && !summary.pendingProposals.some(p => p.kind === 'EFFORT')) {
     buttons.push(action('Send to CEO', 'extra_lock', id, {}, 'primary'));
     buttons.push(action('Re-request estimates', 'extra_open_form', id, { kind: 'rerequest_effort' }));
   }
@@ -218,7 +222,7 @@ export function progressMessage(summary) {
   if (['COLLECTING_EFFORT', 'REVIEWING_EFFORT', 'AWAITING_CEO', 'CEO_REJECTED', 'CEO_CHANGES_REQUESTED'].includes(summary.status)
     || summary.delivery_round === 0) {
     lines.push(`*Effort round ${summary.effort_round}*`);
-    for (const d of summary.departments) lines.push(`• ${clipped(d.department_key)} <@${d.assignee_slack_user_id}>: ${d.effort_minutes == null ? 'pending' : `${d.effort_input_value} ${d.effort_input_unit}`}`);
+    for (const d of summary.departments) lines.push(`• ${clipped(d.department_key)} <@${d.assignee_slack_user_id}>: ${hasEffort(d) ? clipped(effortText(d), 300) : 'pending'}`);
   } else {
     lines.push(`*Delivery round ${summary.delivery_round}*`);
     for (const d of summary.departments) lines.push(`• ${clipped(d.department_key)} <@${d.assignee_slack_user_id}>: ${d.estimated_delivery_at ? formatCairo(d.estimated_delivery_at) : 'pending'}`);
@@ -252,13 +256,13 @@ export function notificationMessage(notification, summary) {
   const assignedDepartments = p.departments?.length ? p.departments : p.department ? [p.department] : [];
   if (assignedDepartments.length) lines.push(`Department${assignedDepartments.length === 1 ? '' : 's'}: ${assignedDepartments.map(d => clipped(d, 80)).join(', ')}`);
   if (p.assigneeId) lines.push(`Submitted by: <@${p.assigneeId}>`);
-  if (p.effortValue != null) lines.push(`*Effort:* ${p.effortValue} ${p.effortUnit}`);
+  if (p.effortText != null) lines.push(`*Effort:* ${clipped(p.effortText, 300)}`);
   if (p.deliveryAt) lines.push(`*Delivery date:* ${formatCairo(p.deliveryAt)}`);
   if (p.note) lines.push(`Note: ${clipped(p.note, 700)}`);
   if (p.finalDeliveryAt) lines.push(`Final delivery: ${formatCairo(p.finalDeliveryAt)}`);
   if (p.contentDeliveryAt) lines.push(`Content delivery: ${formatCairo(p.contentDeliveryAt)}. Choose a date on or after this.`);
   if (event === 'EFFORT_SUBMITTED') {
-    const pending = p.pendingDepartments ?? summary.departments.filter(d => d.effort_minutes == null).map(d => ({ department: d.department_key, assigneeId: d.assignee_slack_user_id }));
+    const pending = p.pendingDepartments ?? summary.departments.filter(d => !hasEffort(d)).map(d => ({ department: d.department_key, assigneeId: d.assignee_slack_user_id }));
     lines.push(`*Still pending:* ${pending.length ? pending.map(d => `${clipped(d.department)} <@${d.assigneeId}>`).join(', ') : 'None'}`);
   }
   if (event === 'DELIVERY_SUBMITTED') {
@@ -267,9 +271,9 @@ export function notificationMessage(notification, summary) {
   }
   if (event === 'ALL_EFFORTS_COLLECTED' || event === 'CEO_APPROVAL_REQUESTED') {
     const estimates = p.estimates ?? p.snapshot?.departments.map(d => ({ department: d.department,
-      value: d.effortInputValue, unit: d.effortInputUnit, note: d.effortNote })) ?? summary.departments.map(d => ({ department: d.department_key,
-      value: d.effort_input_value, unit: d.effort_input_unit, note: d.effort_note }));
-    for (const d of estimates) lines.push(`• ${clipped(d.department)}: ${d.value ?? 'pending'} ${d.unit ?? ''}${d.note ? ` · ${clipped(d.note, 140)}` : ''}`);
+      text: d.effortText ?? (d.effortInputValue == null ? null : `${d.effortInputValue} ${d.effortInputUnit}`), note: d.effortNote })) ?? summary.departments.map(d => ({ department: d.department_key,
+      text: effortText(d), note: d.effort_note }));
+    for (const d of estimates) lines.push(`• ${clipped(d.department)}: ${clipped(d.text ?? (d.value == null ? 'pending' : `${d.value} ${d.unit ?? ''}`), 300)}${d.note ? ` · ${clipped(d.note, 140)}` : ''}`);
   }
   if (event === 'ALL_DELIVERY_ESTIMATES_COLLECTED') {
     const dates = p.dates ?? summary.departments.map(d => ({ department: d.department_key, deliveryAt: d.estimated_delivery_at }));

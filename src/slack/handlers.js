@@ -12,13 +12,6 @@ function date(view, block) {
   const seconds = field(view, block)?.selected_date_time;
   return Number.isInteger(seconds) ? new Date(seconds * 1000).toISOString() : null;
 }
-function effort(view) {
-  const raw = text(view, 'amount');
-  const match = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks)?$/i.exec(raw);
-  if (!match) throw new WorkflowError('VALIDATION_ERROR', 'Enter effort like 3h, 2d, or 1w');
-  const suffix = (match[2] || 'h').toLowerCase();
-  return { value: Number(match[1]), unit: suffix.startsWith('h') ? 'hours' : suffix.startsWith('d') ? 'working_days' : 'working_weeks' };
-}
 function legacyEffort(view) { return { value: Number(text(view, 'amount')), unit: selected(view, 'unit') }; }
 function messageFor(error) {
   if (error instanceof WorkflowError) return `${error.message} (${error.code}). Use /extra <request ID> to refresh.`;
@@ -134,8 +127,8 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
       switch (context.kind) {
         case 'effort': {
           const d = service.getRequestSummary(base.requestId).departments.find(x => x.department_key === context.department);
-          const method = d?.effort_minutes == null ? service.submitEffort : service.reviseOwnEffort;
-          method({ ...base, department: context.department, effort: effort(view), note }, actor);
+          const method = d?.effort_submitted_at == null ? service.submitEffort : service.reviseOwnEffort;
+          method({ ...base, department: context.department, effort: text(view, 'amount'), note }, actor);
           break;
         }
         case 'rerequest_effort': service.reRequestEfforts({ ...base,
