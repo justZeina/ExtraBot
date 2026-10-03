@@ -68,7 +68,9 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     return one("SELECT COUNT(*) AS n FROM proposals WHERE request_id=? AND status='PENDING' AND kind=?", reqId, kind).n;
   }
   function departments(reqId) { return all('SELECT * FROM request_departments WHERE request_id=? ORDER BY id', reqId); }
-  function allEfforts(reqId) { return departments(reqId).every(d => d.effort_minutes != null); }
+  function hasEffort(d) { return d.effort_submitted_at != null; }
+  function effortLabel(d) { return d.effort_text ?? (d.effort_input_value == null ? null : `${d.effort_input_value} ${d.effort_input_unit}`); }
+  function allEfforts(reqId) { return departments(reqId).every(hasEffort); }
   function allDeliveries(reqId) { return departments(reqId).every(d => d.estimated_delivery_at != null); }
   function validateDeliveryRelation(reqId, d, date) {
     const content = departments(reqId).find(x => x.department_key.toLowerCase() === 'content');
@@ -104,7 +106,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       setState(req, 'REVIEWING_EFFORT', actor);
       if (!wasReady) notify(req.id, 'ALL_EFFORTS_COLLECTED', req.marketer_slack_user_id,
         { round: req.effort_round, estimates: departments(req.id).map(d => ({ department: d.department_key,
-          value: d.effort_input_value, unit: d.effort_input_unit, note: d.effort_note })) },
+          text: effortLabel(d), note: d.effort_note })) },
         `efforts-ready:${req.id}:${req.version + 1}`);
     } else if (req.status !== 'CEO_CHANGES_REQUESTED') setState(req, 'COLLECTING_EFFORT', actor);
   }
@@ -121,7 +123,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     const req = request(reqId);
     return { client: req.client, title: req.title, description: req.description, departments: departments(reqId).map(d => ({
       department: d.department_key, assigneeSlackUserId: d.assignee_slack_user_id,
-      effortMinutes: d.effort_minutes, effortInputValue: d.effort_input_value,
+      effortMinutes: d.effort_minutes, effortText: effortLabel(d), effortInputValue: d.effort_input_value,
       effortInputUnit: d.effort_input_unit, effortNote: d.effort_note
     })), comments: all('SELECT department_key,author_slack_user_id,body,created_at FROM request_comments c LEFT JOIN request_departments d ON d.id=c.request_department_id WHERE c.request_id=? ORDER BY c.id', reqId),
       proposals: all("SELECT d.department_key,p.kind,p.current_value,p.proposed_value,p.note,p.status,p.response_note FROM proposals p JOIN request_departments d ON d.id=p.request_department_id WHERE p.request_id=? AND p.kind='EFFORT' ORDER BY p.id", reqId) };
@@ -130,11 +132,13 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     if (!previous) return [];
     const changes = [];
     for (const field of ['client', 'title', 'description']) if (previous[field] !== current[field]) changes.push({ field, before: previous[field], after: current[field] });
-    const old = new Map(previous.departments.map(d => [d.department, d]));
+    const old = new Map(previous.departments.map(d => [d.department, {
+      ...d, effortText: d.effortText ?? (d.effortInputValue == null ? null : `${d.effortInputValue} ${d.effortInputUnit}`)
+    }]));
     for (const d of current.departments) {
       const prior = old.get(d.department);
       if (!prior) changes.push({ department: d.department, before: null, after: d });
-      else for (const field of ['assigneeSlackUserId', 'effortMinutes', 'effortNote']) {
+      else for (const field of ['assigneeSlackUserId', 'effortMinutes', 'effortText', 'effortNote']) {
         if (prior[field] !== d[field]) changes.push({ department: d.department, field, before: prior[field], after: d[field] });
       }
       old.delete(d.department);
@@ -179,7 +183,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       if (d) {
         if (d.assignee_slack_user_id === target) fail('VALIDATION_ERROR', 'assignee is unchanged');
         cancelReminders(d.id);
-        run('UPDATE request_departments SET assignee_slack_user_id=?,effort_minutes=NULL,effort_input_value=NULL,effort_input_unit=NULL,effort_note=NULL,effort_submitted_at=NULL WHERE id=?', target, d.id);
+        run('UPDATE request_departments SET assignee_slack_user_id=?,effort_minutes=NULL,effort_input_value=NULL,effort_input_unit=NULL,effort_text=NULL,effort_note=NULL,effort_submitted_at=NULL WHERE id=?', target, d.id);
       } else {
         const id = Number(run('INSERT INTO request_departments(request_id,department_key,assignee_slack_user_id) VALUES(?,?,?)', req.id, name, target).lastInsertRowid);
         d = { id, assignee_slack_user_id: null };
@@ -206,24 +210,25 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
   }
   function submitEffort({ requestId, department: key, effort, note = null, expectedVersion }, actorId, revise = false) {
     const actor = requireText(actorId, 'actorId');
-    const normalized = normalizeEffort(effort, calendar.workingWeekdays.size);
+    const normalized = typeof effort === 'string' ? null : normalizeEffort(effort, calendar.workingWeekdays.size);
+    const estimate = normalized ? `${normalized.value} ${normalized.unit}` : requireText(effort, 'effort estimate');
     return mutate(requestId, expectedVersion, req => {
       expectState(req, EFFORT_STATES);
       const d = department(req.id, key);
       expectActor(d.assignee_slack_user_id, actor);
-      if (revise !== (d.effort_minutes != null)) fail('INVALID_STATE', revise ? 'no prior estimate to revise' : 'use reviseOwnEffort for an existing estimate');
+      if (revise !== hasEffort(d)) fail('INVALID_STATE', revise ? 'no prior estimate to revise' : 'use reviseOwnEffort for an existing estimate');
       if (one("SELECT id FROM proposals WHERE request_department_id=? AND kind='EFFORT' AND status='PENDING'", d.id)) fail('INVALID_STATE', 'respond to the pending proposal first');
-      run('UPDATE request_departments SET effort_minutes=?,effort_input_value=?,effort_input_unit=?,effort_note=?,effort_submitted_at=? WHERE id=?',
-        normalized.minutes, normalized.value, normalized.unit, note, stamp(), d.id);
+      run('UPDATE request_departments SET effort_minutes=?,effort_input_value=?,effort_input_unit=?,effort_text=?,effort_note=?,effort_submitted_at=? WHERE id=?',
+        normalized?.minutes ?? null, normalized?.value ?? null, normalized?.unit ?? null, estimate, note, stamp(), d.id);
       cancelReminders(d.id);
-      audit(req.id, actor, revise ? 'EFFORT_REVISED' : 'EFFORT_SUBMITTED', { minutes: d.effort_minutes, note: d.effort_note }, { minutes: normalized.minutes, note }, note);
+      audit(req.id, actor, revise ? 'EFFORT_REVISED' : 'EFFORT_SUBMITTED', { estimate: effortLabel(d), note: d.effort_note }, { estimate, note }, note);
       notify(req.id, 'EFFORT_SUBMITTED', req.marketer_slack_user_id,
-        { department: key, assigneeId: actor, effortMinutes: normalized.minutes,
-          effortValue: normalized.value, effortUnit: normalized.unit, revised: revise, round: req.effort_round,
-          pendingDepartments: departments(req.id).filter(x => x.effort_minutes == null).map(x => ({ department: x.department_key, assigneeId: x.assignee_slack_user_id })) },
+        { department: key, assigneeId: actor, effortText: estimate, effortMinutes: normalized?.minutes ?? null,
+          revised: revise, round: req.effort_round,
+          pendingDepartments: departments(req.id).filter(x => !hasEffort(x)).map(x => ({ department: x.department_key, assigneeId: x.assignee_slack_user_id })) },
         `effort-submitted:${req.id}:${d.id}:${req.version + 1}`);
       nextEffortState(req, actor);
-      return { requestId, department: key, effortMinutes: normalized.minutes };
+      return { requestId, department: key, effortText: estimate, effortMinutes: normalized?.minutes ?? null };
     });
   }
   function reRequestEfforts({ requestId, departments: selected, note = null, expectedVersion }, actorId) {
@@ -240,7 +245,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       run('UPDATE extra_requests SET effort_round=? WHERE id=?', round, req.id);
       for (const d of chosen) {
         cancelReminders(d.id);
-        run('UPDATE request_departments SET effort_minutes=NULL,effort_input_value=NULL,effort_input_unit=NULL,effort_note=NULL,effort_submitted_at=NULL WHERE id=?', d.id);
+        run('UPDATE request_departments SET effort_minutes=NULL,effort_input_value=NULL,effort_input_unit=NULL,effort_text=NULL,effort_note=NULL,effort_submitted_at=NULL WHERE id=?', d.id);
         scheduleReminder(req.id, d, stamp());
         notify(req.id, 'EFFORT_REREQUESTED', d.assignee_slack_user_id,
           { department: d.department_key, round, note }, `effort-rerequest:${req.id}:${d.id}:${round}`);
@@ -312,9 +317,11 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       const next = decision === 'ACCEPT' ? fresh.proposed_value : kind === 'EFFORT' ? counter.minutes : counter;
       if (kind === 'DELIVERY' && next <= stamp()) fail('VALIDATION_ERROR', 'delivery date must be in the future');
       if (kind === 'DELIVERY') validateDeliveryRelation(req.id, d, next);
-      if (kind === 'EFFORT') run('UPDATE request_departments SET effort_minutes=?,effort_input_value=?,effort_input_unit=?,effort_note=?,effort_submitted_at=? WHERE id=?',
+      if (kind === 'EFFORT') run('UPDATE request_departments SET effort_minutes=?,effort_input_value=?,effort_input_unit=?,effort_text=?,effort_note=?,effort_submitted_at=? WHERE id=?',
         Number(next), decision === 'ACCEPT' ? fresh.proposed_input_value : counter.value,
-        decision === 'ACCEPT' ? fresh.proposed_input_unit : counter.unit, note, stamp(), d.id);
+        decision === 'ACCEPT' ? fresh.proposed_input_unit : counter.unit,
+        `${decision === 'ACCEPT' ? fresh.proposed_input_value : counter.value} ${decision === 'ACCEPT' ? fresh.proposed_input_unit : counter.unit}`,
+        note, stamp(), d.id);
       else run('UPDATE request_departments SET estimated_delivery_at=?,delivery_note=?,delivery_submitted_at=? WHERE id=?', next, note, stamp(), d.id);
       run('UPDATE proposals SET status=?,response_note=?,responded_by_slack_user_id=?,resolved_at=? WHERE id=?',
         decision === 'ACCEPT' ? 'ACCEPTED' : 'COUNTERED', note, actor, stamp(), proposalId);
@@ -505,13 +512,13 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
   function processDueReminders(nowValue = stamp()) {
     const dueAt = typeof nowValue === 'string' ? parseInstant(nowValue, 'now') : new Date(nowValue).toISOString();
     return transaction(() => {
-      const jobs = all(`SELECT j.*,d.assignee_slack_user_id,d.department_key,d.effort_minutes,r.status,r.effort_round
+      const jobs = all(`SELECT j.*,d.assignee_slack_user_id,d.department_key,d.effort_submitted_at,r.status,r.effort_round
         FROM reminder_jobs j JOIN request_departments d ON d.id=j.request_department_id
         JOIN extra_requests r ON r.id=j.request_id
         WHERE j.sent_at IS NULL AND j.cancelled_at IS NULL AND j.due_at<=? ORDER BY j.id`, dueAt);
       let queued = 0;
       for (const job of jobs) {
-        if (job.effort_minutes == null && EFFORT_STATES.includes(job.status)) {
+        if (job.effort_submitted_at == null && EFFORT_STATES.includes(job.status)) {
           notify(job.request_id, 'EFFORT_REMINDER', job.assignee_slack_user_id,
             { department: job.department_key, reminderJobId: job.id, round: job.effort_round }, `reminder:${job.id}`);
           run('UPDATE reminder_jobs SET sent_at=? WHERE id=?', dueAt, job.id);

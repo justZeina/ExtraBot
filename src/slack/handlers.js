@@ -12,16 +12,9 @@ function date(view, block) {
   const seconds = field(view, block)?.selected_date_time;
   return Number.isInteger(seconds) ? new Date(seconds * 1000).toISOString() : null;
 }
-function effort(view) {
-  const raw = text(view, 'amount');
-  const match = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks)?$/i.exec(raw);
-  if (!match) throw new WorkflowError('VALIDATION_ERROR', 'Enter effort like 3h, 2d, or 1w');
-  const suffix = (match[2] || 'h').toLowerCase();
-  return { value: Number(match[1]), unit: suffix.startsWith('h') ? 'hours' : suffix.startsWith('d') ? 'working_days' : 'working_weeks' };
-}
 function legacyEffort(view) { return { value: Number(text(view, 'amount')), unit: selected(view, 'unit') }; }
 function messageFor(error) {
-  if (error instanceof WorkflowError) return `${error.message} (${error.code}). Use /extra <request ID> to refresh.`;
+  if (error instanceof WorkflowError) return `${error.message} (${error.code}). Open the latest request message to refresh.`;
   return 'Something went wrong. Please try again or check the app logs.';
 }
 
@@ -42,7 +35,7 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
   };
   const afterMutation = async (client, actor, requestId, created = false) => {
     const summary = service.getRequestSummary(requestId);
-    const status = created ? `Extra #${requestId} was sent. *Status:* ${statusLabel(summary.status)}` : `Extra #${requestId} updated. *Status:* ${statusLabel(summary.status)}`;
+    const status = created ? `${summary.title} was sent. *Status:* ${statusLabel(summary.status)}` : `${summary.title} updated. *Status:* ${statusLabel(summary.status)}`;
     const statusMessage = (recipient, heading) => {
       const message = summaryMessage(summary, recipient, ceoSlackUserId, configured);
       return { ...message, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: heading } }, ...message.blocks] };
@@ -70,11 +63,11 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
         await client.views.open({ trigger_id: command.trigger_id, view: createDetailsView(configured) });
       } else if (instruction === 'list') {
         const rows = service.listRequestsForActor(command.user_id);
-        const lines = rows.length ? rows.map(r => `• #${r.id} — ${r.title} (${r.status})`).join('\n') : 'No requests found.';
-        await respond({ response_type: 'ephemeral', text: `${lines}\nUse /extra <ID> to open a request.` });
+        const lines = rows.length ? rows.map(r => `• ${r.title} (${r.status})`).join('\n') : 'No requests found.';
+        await respond({ response_type: 'ephemeral', text: `${lines}\nUse the View current request button in a message to open it.` });
       } else if (/^\d+$/.test(instruction)) {
         await respond({ response_type: 'ephemeral', ...show(Number(instruction), command.user_id) });
-      } else await respond({ response_type: 'ephemeral', text: 'Use `/extra` to create, `/extra list` to find requests, or `/extra <ID>` to view one.' });
+      } else await respond({ response_type: 'ephemeral', text: 'Use `/extra` to create or `/extra list` to find requests.' });
     } catch (error) { await respond({ response_type: 'ephemeral', text: messageFor(error) }); }
   });
   app.shortcut('extra_new', async ({ shortcut, ack, client }) => {
@@ -138,8 +131,8 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
       switch (context.kind) {
         case 'effort': {
           const d = service.getRequestSummary(base.requestId).departments.find(x => x.department_key === context.department);
-          const method = d?.effort_minutes == null ? service.submitEffort : service.reviseOwnEffort;
-          method({ ...base, department: context.department, effort: effort(view), note }, actor);
+          const method = d?.effort_submitted_at == null ? service.submitEffort : service.reviseOwnEffort;
+          method({ ...base, department: context.department, effort: text(view, 'amount'), note }, actor);
           break;
         }
         case 'rerequest_effort': service.reRequestEfforts({ ...base,

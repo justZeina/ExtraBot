@@ -119,10 +119,11 @@ test('notification button opens an actionable request modal and effort form', as
     assert.equal(f.updatedViews[0].view.callback_id, 'extra_form');
     let formAck;
     await f.handlers.view.extra_form({ body: { user: { id: 'ART' } }, view: { private_metadata: f.updatedViews[0].view.private_metadata,
-      blocks: f.updatedViews[0].view.blocks, state: { values: { amount: { value: { value: '2h' } },
+      blocks: f.updatedViews[0].view.blocks, state: { values: { amount: { value: { value: 'About two days, pending assets' } },
         note: { value: { value: 'Draft plus review' } } } } },
       ack: async value => { formAck = value; }, client: f.client });
-    assert.equal(service.getRequestSummary(id).departments[0].effort_minutes, 120);
+    assert.equal(service.getRequestSummary(id).departments[0].effort_text, 'About two days, pending assets');
+    assert.equal(service.getRequestSummary(id).departments[0].effort_minutes, null);
     assert.equal(service.getRequestSummary(id).departments[0].effort_note, 'Draft plus review');
     assert.equal(formAck.response_action, 'update');
     assert.equal(formAck.view.callback_id, 'extra_request');

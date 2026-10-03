@@ -99,4 +99,14 @@ export function migrate(db) {
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=6').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!db.prepare("PRAGMA table_info(request_departments)").all().some(column => column.name === 'effort_text')) {
+        db.exec('ALTER TABLE request_departments ADD COLUMN effort_text TEXT');
+      }
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 }
