@@ -248,3 +248,16 @@ test('one assignee receives one initial request for multiple departments and out
     assert.ok(!f.service.getPendingNotifications().some(n => n.id === assignments[0].id));
   } finally { f.close(); }
 });
+
+test('a retried Slack modal submission creates one request', () => {
+  const f = fixture();
+  try {
+    const input = { client: 'Acme', title: 'Campaign', description: 'Assets', submissionKey: 'team:marketer:view-123',
+      departments: [{ department: 'Art', assigneeId: 'ART' }] };
+    const first = f.service.createRequest(input, 'MARKETER');
+    const second = f.service.createRequest(input, 'MARKETER');
+    assert.equal(second.id, first.id);
+    assert.equal(f.service.listRequestsForActor('MARKETER').length, 1);
+    assert.equal(f.service.getPendingNotifications().filter(n => n.event_type === 'EFFORT_REQUESTED').length, 1);
+  } finally { f.close(); }
+});

@@ -163,6 +163,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
 
   function createRequest(input, actorId) {
     const actor = requireText(actorId, 'actorId');
+    const submissionKey = input?.submissionKey == null ? null : requireText(input.submissionKey, 'submissionKey');
     const client = input?.client == null ? '' : requireText(input.client, 'client');
     const title = requireText(input?.title, 'title');
     const description = requireText(input?.description, 'description');
@@ -171,8 +172,13 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
     const normalized = selected.map(d => ({ department: requireText(d.department, 'department'), assigneeId: requireText(d.assigneeId, 'assigneeId') }));
     if (new Set(normalized.map(d => d.department.toLowerCase())).size !== normalized.length) fail('VALIDATION_ERROR', 'departments must be unique');
     return transaction(() => {
+      if (submissionKey) {
+        const previous = one('SELECT request_id FROM request_submissions WHERE submission_key=?', submissionKey);
+        if (previous) return getRequestSummary(previous.request_id);
+      }
       const t = stamp();
       const id = Number(run('INSERT INTO extra_requests(client,title,description,marketer_slack_user_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)', client, title, description, actor, 'COLLECTING_EFFORT', t, t).lastInsertRowid);
+      if (submissionKey) run('INSERT INTO request_submissions(submission_key,request_id) VALUES(?,?)', submissionKey, id);
       for (const item of normalized) {
         const deptId = Number(run('INSERT INTO request_departments(request_id,department_key,assignee_slack_user_id) VALUES(?,?,?)', id, item.department, item.assigneeId).lastInsertRowid);
         scheduleReminder(id, { id: deptId }, t);

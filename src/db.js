@@ -132,4 +132,15 @@ export function migrate(db) {
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=8').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS request_submissions (
+        submission_key TEXT PRIMARY KEY,
+        request_id INTEGER NOT NULL REFERENCES extra_requests(id)
+      )`);
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 }

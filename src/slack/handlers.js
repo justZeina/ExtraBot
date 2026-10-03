@@ -91,7 +91,7 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
     if (Object.keys(errors).length) return ack({ response_action: 'errors', errors });
     let created;
     try { created = service.createRequest({ client: clientName, title, description,
-      departments: selected }, body.user.id); }
+      departments: selected, submissionKey: view.id ? `${body.team?.id || 'workspace'}:${body.user.id}:${view.id}` : null }, body.user.id); }
     catch (error) { return ack({ response_action: 'errors', errors: { client: messageFor(error) } }); }
     await ack({ response_action: 'update', view: createdView(created) });
     await afterMutation(created.id);
