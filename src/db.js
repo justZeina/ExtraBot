@@ -109,4 +109,23 @@ export function migrate(db) {
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=7').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const columns = db.prepare('PRAGMA table_info(notification_outbox)').all().map(column => column.name);
+      if (!columns.includes('claim_token')) db.exec('ALTER TABLE notification_outbox ADD COLUMN claim_token TEXT');
+      if (!columns.includes('claimed_at')) db.exec('ALTER TABLE notification_outbox ADD COLUMN claimed_at TEXT');
+      db.exec(`CREATE TABLE IF NOT EXISTS request_message_cards (
+        request_id INTEGER NOT NULL REFERENCES extra_requests(id),
+        recipient_slack_user_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(request_id, recipient_slack_user_id, kind)
+      )`);
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 }

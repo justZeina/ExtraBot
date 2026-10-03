@@ -227,6 +227,24 @@ test('delivery request and re-request preserve Content priority and notify all t
     s.submitDeliveryEstimate({ requestId: id, department: 'Art', deliveryAt: '2026-10-08T10:00:00Z', expectedVersion: version() }, 'ART');
     s.approveFinalDelivery({ requestId: id, expectedVersion: version() }, 'MARKETER');
     const recipients = s.getPendingNotifications().filter(n => n.event_type === 'FINAL_DELIVERY_APPROVED').map(n => n.recipient_slack_user_id);
-    assert.deepEqual(new Set(recipients), new Set(['MARKETER', 'CEO', 'CONTENT', 'ART']));
+    assert.deepEqual(new Set(recipients), new Set(['CONTENT', 'ART']));
+  } finally { f.close(); }
+});
+
+test('one assignee receives one initial request for multiple departments and outbox claims are exclusive', () => {
+  const f = fixture();
+  try {
+    const id = f.service.createRequest({ client: 'Acme', title: 'Campaign', description: 'Assets', departments: [
+      { department: 'Content', assigneeId: 'SAME' }, { department: 'Art', assigneeId: 'SAME' }
+    ] }, 'MARKETER').id;
+    const notices = f.service.getPendingNotifications();
+    const assignments = notices.filter(n => n.event_type === 'EFFORT_REQUESTED');
+    assert.equal(assignments.length, 1);
+    assert.deepEqual(assignments[0].payload.departments, ['Content', 'Art']);
+    assert.ok(notices.some(n => n.event_type === 'MARKETER_CREATED' && n.request_id === id));
+    assert.equal(f.service.claimNotification(assignments[0].id, 'first'), true);
+    assert.equal(f.service.claimNotification(assignments[0].id, 'second'), false);
+    f.service.markNotification(assignments[0].id, 'SENT', 'first');
+    assert.ok(!f.service.getPendingNotifications().some(n => n.id === assignments[0].id));
   } finally { f.close(); }
 });
