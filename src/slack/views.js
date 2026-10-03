@@ -210,6 +210,79 @@ export function requestView(summary, actor, ceoId, configuredDepartments) {
     close: plain('Close'), blocks };
 }
 
+export function createdView(summary) {
+  return { type: 'modal', callback_id: 'extra_created', title: plain('Request sent'), close: plain('Done'),
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text:
+      `*${clipped(summary.title, 180)}* was sent. Assigned teams have been asked for their effort estimates.` } }] };
+}
+
+export function cardMessage(summary, card, ceoId, configuredDepartments) {
+  const actor = card.recipient_slack_user_id;
+  if (card.kind === 'MARKETER' || card.kind === 'MARKETER_PROGRESS') {
+    return summaryMessage(summary, actor, ceoId, configuredDepartments);
+  }
+  if (card.kind.startsWith('CEO:')) {
+    const message = summaryMessage(summary, actor, ceoId, configuredDepartments);
+    if (Number(card.kind.slice(4)) !== summary.latestApproval?.id) {
+      return { ...message, blocks: message.blocks.filter(block => block.type !== 'actions') };
+    }
+    return message;
+  }
+  const [phase, rawRound] = card.kind.split(':');
+  if (phase !== 'EFFORT' && phase !== 'DELIVERY') return summaryMessage(summary, actor, ceoId, configuredDepartments);
+  const round = Number(rawRound);
+  const assigned = JSON.parse(card.departments_json || '[]');
+  const rows = summary.departments.filter(d => assigned.includes(d.department_key));
+  const isEffort = phase === 'EFFORT';
+  const currentRound = isEffort ? summary.effort_round : summary.delivery_round;
+  const active = round === currentRound && (isEffort ? summary.status === 'COLLECTING_EFFORT' : summary.status === 'COLLECTING_DELIVERY');
+  const lines = [`*${clipped(summary.title, 180)}*`, `*Client:* ${clipped(summary.client || '—', 120)}`,
+    `*Description:* ${clipped(summary.description, 900)}`, `*Requested by:* <@${summary.marketer_slack_user_id}>`,
+    `*${isEffort ? 'Effort estimate' : 'Delivery date'} · round ${round}*`];
+  if (card.note) lines.push(`*Marketer note:* ${clipped(card.note, 500)}`);
+  if (round !== currentRound) lines.push('This round is complete. See the latest request for current actions.');
+  else lines.push(`*Status:* ${statusLabel(summary.status)}`);
+  const content = summary.departments.find(d => d.department_key.toLowerCase() === 'content');
+  const buttons = [];
+  for (const d of rows) {
+    if (d.assignee_slack_user_id !== actor) continue;
+    lines.push(`• *${clipped(d.department_key)}:* ${isEffort
+      ? hasEffort(d) ? clipped(effortText(d), 300) : 'pending'
+      : d.estimated_delivery_at ? formatCairo(d.estimated_delivery_at) : 'pending'}`);
+    if (isEffort && d.effort_note) lines.push(`  Note: ${clipped(d.effort_note, 250)}`);
+    if (!isEffort && d.delivery_note) lines.push(`  Note: ${clipped(d.delivery_note, 250)}`);
+    if (active && (isEffort || d.department_key.toLowerCase() === 'content' || !content || content.estimated_delivery_at)) {
+      buttons.push(action(isEffort ? `${hasEffort(d) ? 'Edit' : 'Submit'} ${d.department_key} effort`
+        : `${d.estimated_delivery_at ? 'Edit' : 'Submit'} ${d.department_key} date`,
+      `extra_open_form:${buttons.length}`, summary.id, { kind: isEffort ? 'effort' : 'delivery',
+        department: d.department_key, round, roundType: isEffort ? 'effort' : 'delivery' }, 'primary'));
+    }
+  }
+  if (!isEffort && content?.estimated_delivery_at && !assigned.some(name => name.toLowerCase() === 'content')) {
+    lines.push(`*Content delivery:* ${formatCairo(content.estimated_delivery_at)}. Choose a date on or after this.`);
+  }
+  buttons.push(button('View current request', 'extra_view', { requestId: summary.id }));
+  return { text: `${summary.title} · ${isEffort ? 'effort' : 'delivery'} round ${round}`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(buttons)] };
+}
+
+export function shortAlert(event, summary, payload = {}) {
+  const title = clipped(summary.title, 180);
+  const department = clipped(payload.department || 'Team', 80);
+  const messages = {
+    EFFORT_SUBMITTED: `🔴 ${department} ${payload.revised ? 'updated its estimate' : 'replied'} · ${title}`,
+    DELIVERY_SUBMITTED: `🔴 ${department} ${payload.revised ? 'updated its date' : 'replied'} · ${title}`,
+    ALL_EFFORTS_COLLECTED: `✅ Estimates ready · ${title}`,
+    ALL_DELIVERY_ESTIMATES_COLLECTED: `✅ Delivery dates ready · ${title}`,
+    CEO_APPROVED: `✅ CEO approved · ${title}`,
+    CEO_REJECTED: `❌ CEO rejected · ${title}`,
+    FINAL_DELIVERY_APPROVED: `🚀 Approved to start · ${title}`,
+    EFFORT_REMINDER: `⏰ Effort estimate still needed · ${title}`,
+    QUESTION_ADDED: `💬 New note · ${title}`
+  };
+  return { text: messages[event] || `🔔 ${clipped(event, 80)} · ${title}` };
+}
+
 const eventTitles = {
   EFFORT_REQUESTED: 'Please submit your effort estimate', EFFORT_REMINDER: 'Effort estimate reminder',
   EFFORT_REREQUESTED: 'Updated effort estimate requested',

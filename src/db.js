@@ -124,6 +124,10 @@ export function migrate(db) {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(request_id, recipient_slack_user_id, kind)
       )`);
+      const cardColumns = db.prepare('PRAGMA table_info(request_message_cards)').all().map(column => column.name);
+      if (!cardColumns.includes('departments_json')) db.exec("ALTER TABLE request_message_cards ADD COLUMN departments_json TEXT NOT NULL DEFAULT '[]'");
+      if (!cardColumns.includes('note')) db.exec('ALTER TABLE request_message_cards ADD COLUMN note TEXT');
+      db.prepare('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)').run(new Date().toISOString());
       db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)').run(new Date().toISOString());
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }

@@ -458,7 +458,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
       run('UPDATE request_departments SET estimated_delivery_at=?,delivery_note=?,delivery_submitted_at=? WHERE id=?', date, note, stamp(), d.id);
       audit(req.id, actor, d.estimated_delivery_at ? 'DELIVERY_REVISED' : 'DELIVERY_SUBMITTED', { deliveryAt: d.estimated_delivery_at }, { deliveryAt: date }, note);
       notify(req.id, 'DELIVERY_SUBMITTED', req.marketer_slack_user_id,
-        { department: key, assigneeId: actor, deliveryAt: date, round: req.delivery_round,
+        { department: key, assigneeId: actor, deliveryAt: date, revised: Boolean(d.estimated_delivery_at), round: req.delivery_round,
           pendingDepartments: departments(req.id).filter(x => x.estimated_delivery_at == null).map(x => ({ department: x.department_key, assigneeId: x.assignee_slack_user_id })) },
         `delivery-submitted:${req.id}:${d.id}:${req.version + 1}`);
       if (content?.id === d.id && !d.estimated_delivery_at) {
@@ -511,7 +511,7 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
   function listRequestsForActor(actorId, limit = 20) {
     const actor = requireText(actorId, 'actorId');
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail('VALIDATION_ERROR', 'limit must be 1 to 100');
-    return all(`SELECT DISTINCT r.id,r.title,r.status,r.version,r.updated_at
+    return all(`SELECT DISTINCT r.id,r.client,r.title,r.status,r.version,r.updated_at
       FROM extra_requests r LEFT JOIN request_departments d ON d.request_id=r.id
       WHERE r.marketer_slack_user_id=? OR d.assignee_slack_user_id=? OR ?=?
       ORDER BY r.updated_at DESC,r.id DESC LIMIT ?`, actor, actor, actor, ceoId, limit);
@@ -523,16 +523,24 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
         FROM reminder_jobs j JOIN request_departments d ON d.id=j.request_department_id
         JOIN extra_requests r ON r.id=j.request_id
         WHERE j.sent_at IS NULL AND j.cancelled_at IS NULL AND j.due_at<=? ORDER BY j.id`, dueAt);
-      let queued = 0;
+      const reminders = new Map();
       for (const job of jobs) {
         if (job.effort_submitted_at == null && EFFORT_STATES.includes(job.status)) {
-          notify(job.request_id, 'EFFORT_REMINDER', job.assignee_slack_user_id,
-            { department: job.department_key, reminderJobId: job.id, round: job.effort_round }, `reminder:${job.id}`);
+          const key = `${job.request_id}:${job.assignee_slack_user_id}:${job.effort_round}`;
+          const group = reminders.get(key) ?? { requestId: job.request_id, recipientId: job.assignee_slack_user_id,
+            round: job.effort_round, departments: [], jobIds: [] };
+          group.departments.push(job.department_key);
+          group.jobIds.push(job.id);
+          reminders.set(key, group);
           run('UPDATE reminder_jobs SET sent_at=? WHERE id=?', dueAt, job.id);
-          queued++;
         } else run('UPDATE reminder_jobs SET cancelled_at=? WHERE id=?', dueAt, job.id);
       }
-      return { queued };
+      for (const reminder of reminders.values()) {
+        notify(reminder.requestId, 'EFFORT_REMINDER', reminder.recipientId,
+          { department: reminder.departments[0], departments: reminder.departments, round: reminder.round },
+          `reminder:${reminder.jobIds.join('-')}`);
+      }
+      return { queued: reminders.size };
     });
   }
   function getPendingNotifications(limit = 100) {
@@ -572,13 +580,14 @@ export function createExtraService({ dbPath = ':memory:', ceoSlackUserId, workin
   function listMessageCards(requestId) {
     return all('SELECT * FROM request_message_cards WHERE request_id=? ORDER BY kind,recipient_slack_user_id', requestId);
   }
-  function saveMessageCard({ requestId, recipientId, kind, channelId, messageTs }) {
+  function saveMessageCard({ requestId, recipientId, kind, channelId, messageTs, departments: assigned = [], note = null }) {
     return transaction(() => {
-      run(`INSERT INTO request_message_cards(request_id,recipient_slack_user_id,kind,channel_id,message_ts,updated_at)
-        VALUES(?,?,?,?,?,?) ON CONFLICT(request_id,recipient_slack_user_id,kind)
-        DO UPDATE SET channel_id=excluded.channel_id,message_ts=excluded.message_ts,updated_at=excluded.updated_at`,
+      run(`INSERT INTO request_message_cards(request_id,recipient_slack_user_id,kind,channel_id,message_ts,updated_at,departments_json,note)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(request_id,recipient_slack_user_id,kind)
+        DO UPDATE SET channel_id=excluded.channel_id,message_ts=excluded.message_ts,updated_at=excluded.updated_at,
+          departments_json=excluded.departments_json,note=excluded.note`,
       requestId, requireText(recipientId, 'recipientId'), requireText(kind, 'kind'),
-      requireText(channelId, 'channelId'), requireText(messageTs, 'messageTs'), stamp());
+      requireText(channelId, 'channelId'), requireText(messageTs, 'messageTs'), stamp(), json(assigned), note);
     });
   }
   return {

@@ -1,5 +1,5 @@
 import { WorkflowError } from '../errors.js';
-import { canView, createDetailsView, formView, parseDepartments, requestView, statusLabel, summaryMessage } from './views.js';
+import { canView, createdView, createDetailsView, formView, parseDepartments, requestView, summaryMessage } from './views.js';
 
 function decode(value) {
   try { return JSON.parse(value || '{}'); } catch { return {}; }
@@ -21,10 +21,12 @@ function messageFor(error) {
 export async function sendDirect(client, recipient, message) {
   const result = await client.conversations.open({ users: recipient });
   if (!result.channel?.id) throw new Error('Slack did not return a DM channel');
-  return client.chat.postMessage({ channel: result.channel.id, ...message });
+  const posted = await client.chat.postMessage({ channel: result.channel.id, ...message });
+  return { ...posted, channel: posted.channel ?? result.channel.id };
 }
 
-export function registerSlackHandlers(app, { service, ceoSlackUserId, departments, flushOutbox, logger = console }) {
+export function registerSlackHandlers(app, { service, ceoSlackUserId, departments, flushOutbox,
+  syncCards = async () => {}, logger = console }) {
   const configured = parseDepartments(departments.join(','));
   const registerAction = (actionId, handler) => {
     app.action(actionId, handler);
@@ -33,15 +35,9 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
   const safeDirect = async (client, actor, message) => {
     try { await sendDirect(client, actor, message); } catch (error) { logger.error(`Could not DM actor: ${error.message}`); }
   };
-  const afterMutation = async (client, actor, requestId, created = false) => {
-    const summary = service.getRequestSummary(requestId);
-    const status = created ? `${summary.title} was sent. *Status:* ${statusLabel(summary.status)}` : `${summary.title} updated. *Status:* ${statusLabel(summary.status)}`;
-    const statusMessage = (recipient, heading) => {
-      const message = summaryMessage(summary, recipient, ceoSlackUserId, configured);
-      return { ...message, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: heading } }, ...message.blocks] };
-    };
-    await safeDirect(client, actor, statusMessage(actor, status));
+  const afterMutation = async requestId => {
     try { await flushOutbox(); } catch (error) { logger.error(`Outbox delivery failed: ${error.message}`); }
+    try { await syncCards(requestId); } catch (error) { logger.error(`Card update failed: ${error.message}`); }
   };
   const show = (requestId, actor) => {
     const summary = service.getRequestSummary(requestId);
@@ -63,8 +59,12 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
         await client.views.open({ trigger_id: command.trigger_id, view: createDetailsView(configured) });
       } else if (instruction === 'list') {
         const rows = service.listRequestsForActor(command.user_id);
-        const lines = rows.length ? rows.map(r => `• ${r.title} (${r.status})`).join('\n') : 'No requests found.';
-        await respond({ response_type: 'ephemeral', text: `${lines}\nUse the View current request button in a message to open it.` });
+        const blocks = rows.map((row, index) => ({ type: 'section',
+          text: { type: 'plain_text', text: `${row.title} · ${row.client || 'No client'} · ${row.status}`.slice(0, 3000) },
+          accessory: { type: 'button', text: { type: 'plain_text', text: 'View' },
+            action_id: `extra_view:${index}`, value: JSON.stringify({ requestId: row.id }) } }));
+        await respond({ response_type: 'ephemeral', text: rows.length ? 'Your requests' : 'No requests found.',
+          ...(blocks.length ? { blocks } : {}) });
       } else if (/^\d+$/.test(instruction)) {
         await respond({ response_type: 'ephemeral', ...show(Number(instruction), command.user_id) });
       } else await respond({ response_type: 'ephemeral', text: 'Use `/extra` to create or `/extra list` to find requests.' });
@@ -93,11 +93,11 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
     try { created = service.createRequest({ client: clientName, title, description,
       departments: selected }, body.user.id); }
     catch (error) { return ack({ response_action: 'errors', errors: { client: messageFor(error) } }); }
-    await ack();
-    await afterMutation(client, body.user.id, created.id, true);
+    await ack({ response_action: 'update', view: createdView(created) });
+    await afterMutation(created.id);
   });
 
-  app.action('extra_view', async ({ body, action, ack, client }) => {
+  registerAction('extra_view', async ({ body, action, ack, client }) => {
     await ack();
     try {
       const requestId = decode(action.value).requestId;
@@ -157,11 +157,9 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
       const firstBlock = view.blocks.find(x => x.type === 'input')?.block_id;
       return ack({ response_action: 'errors', errors: { [firstBlock || 'note']: messageFor(error).slice(0, 2000) } });
     }
-    if (context.fromRequestView) {
-      const summary = service.getRequestSummary(base.requestId);
-      await ack({ response_action: 'update', view: requestView(summary, actor, ceoSlackUserId, configured) });
-    } else await ack();
-    await afterMutation(client, actor, base.requestId);
+    const summary = service.getRequestSummary(base.requestId);
+    await ack({ response_action: 'update', view: requestView(summary, actor, ceoSlackUserId, configured) });
+    await afterMutation(base.requestId);
   });
 
   const quick = (actionId, fn) => registerAction(actionId, async ({ body, action, ack, client }) => {
@@ -171,14 +169,20 @@ export function registerSlackHandlers(app, { service, ceoSlackUserId, department
       const summary = service.getRequestSummary(data.requestId);
       checkRound(summary, data);
       fn(data, summary, body.user.id);
+      const refreshed = service.getRequestSummary(data.requestId);
       if (body.view?.id) {
         try {
-          const refreshed = service.getRequestSummary(data.requestId);
           await client.views.update({ view_id: body.view.id,
             view: requestView(refreshed, body.user.id, ceoSlackUserId, configured) });
         } catch (error) { logger.error(`Could not refresh request view: ${error.message}`); }
       }
-      await afterMutation(client, body.user.id, data.requestId);
+      await afterMutation(data.requestId);
+      if (!body.view?.id && body.channel?.id && body.message?.ts &&
+        !service.listMessageCards(data.requestId).some(card => card.channel_id === body.channel.id && card.message_ts === body.message.ts)) {
+        try { await client.chat.update({ channel: body.channel.id, ts: body.message.ts,
+          ...summaryMessage(refreshed, body.user.id, ceoSlackUserId, configured) }); }
+        catch (error) { logger.error(`Could not refresh older request message: ${error.message}`); }
+      }
     } catch (error) { await safeDirect(client, body.user.id, { text: messageFor(error) }); }
   });
   quick('extra_lock', (data, summary, actor) => service.lockAndRequestCeoApproval({ requestId: data.requestId, expectedVersion: summary.version }, actor));
