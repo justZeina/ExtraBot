@@ -99,4 +99,48 @@ export function migrate(db) {
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=6').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!db.prepare("PRAGMA table_info(request_departments)").all().some(column => column.name === 'effort_text')) {
+        db.exec('ALTER TABLE request_departments ADD COLUMN effort_text TEXT');
+      }
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=7').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const columns = db.prepare('PRAGMA table_info(notification_outbox)').all().map(column => column.name);
+      if (!columns.includes('claim_token')) db.exec('ALTER TABLE notification_outbox ADD COLUMN claim_token TEXT');
+      if (!columns.includes('claimed_at')) db.exec('ALTER TABLE notification_outbox ADD COLUMN claimed_at TEXT');
+      db.exec(`CREATE TABLE IF NOT EXISTS request_message_cards (
+        request_id INTEGER NOT NULL REFERENCES extra_requests(id),
+        recipient_slack_user_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(request_id, recipient_slack_user_id, kind)
+      )`);
+      const cardColumns = db.prepare('PRAGMA table_info(request_message_cards)').all().map(column => column.name);
+      if (!cardColumns.includes('departments_json')) db.exec("ALTER TABLE request_message_cards ADD COLUMN departments_json TEXT NOT NULL DEFAULT '[]'");
+      if (!cardColumns.includes('note')) db.exec('ALTER TABLE request_message_cards ADD COLUMN note TEXT');
+      db.prepare('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,?)').run(new Date().toISOString());
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  if (!db.prepare('SELECT version FROM schema_migrations WHERE version=8').get()) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`CREATE TABLE IF NOT EXISTS request_submissions (
+        submission_key TEXT PRIMARY KEY,
+        request_id INTEGER NOT NULL REFERENCES extra_requests(id)
+      )`);
+      db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)').run(new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
 }

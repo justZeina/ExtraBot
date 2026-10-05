@@ -3,6 +3,9 @@ import { formatCairo } from '../time.js';
 const plain = text => ({ type: 'plain_text', text: String(text) });
 const escape = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const clipped = (value, max = 2500) => escape(String(value ?? '')).slice(0, max);
+const hasEffort = department => department.effort_submitted_at != null;
+const effortText = department => department.effort_text ?? (department.effort_input_value == null
+  ? 'pending' : `${department.effort_input_value} ${department.effort_input_unit}`);
 const input = (id, label, element, optional = false) => ({ type: 'input', block_id: id, label: plain(label), element: { ...element, action_id: 'value' }, optional });
 const textInput = (id, label, initial = undefined, multiline = false, optional = false) => input(id, label,
   { type: 'plain_text_input', ...(initial != null ? { initial_value: String(initial) } : {}), multiline }, optional);
@@ -49,8 +52,9 @@ export function formView(kind, context, summary, departments) {
     `*${clipped(summary.title, 150)}*\n*Client:* ${clipped(summary.client || '—', 100)}\n*Description:* ${clipped(summary.description, 1000)}\n*Requested by:* <@${summary.marketer_slack_user_id}>` } });
   if (kind === 'effort') {
     blocks.push(details());
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*${clipped(department)} effort request · round ${summary.effort_round}*\nEnter hours as 3h, days as 2d, or weeks as 1w. A number alone means hours.` }] });
-    blocks.push(textInput('amount', 'Effort estimate'));
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `*${clipped(department)} effort request · round ${summary.effort_round}*` }] });
+    const existing = summary.departments.find(d => d.department_key === department);
+    blocks.push(textInput('amount', 'Effort estimate', existing && hasEffort(existing) ? effortText(existing) : undefined, true));
     blocks.push(textInput('note', 'Optional Note', undefined, true, true));
   } else if (['propose_effort', 'counter_effort'].includes(kind)) {
     blocks.push(textInput('amount', 'Effort amount, e.g. 2.5'));
@@ -78,7 +82,7 @@ export function formView(kind, context, summary, departments) {
   } else if (kind === 'ceo_decision') {
     blocks.push(details());
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: summary.departments.map(d =>
-      `• *${clipped(d.department_key)}:* ${d.effort_input_value} ${d.effort_input_unit}${d.effort_note ? ` · ${clipped(d.effort_note, 180)}` : ''}`).join('\n') } });
+      `• *${clipped(d.department_key)}:* ${clipped(effortText(d), 300)}${d.effort_note ? ` · ${clipped(d.effort_note, 180)}` : ''}`).join('\n') } });
     blocks.push(textInput('note', 'Optional Note', undefined, true, true));
   } else if (kind === 'delivery_request') {
     blocks.push(details());
@@ -123,12 +127,12 @@ export function statusLabel(status) {
 
 export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
   const id = summary.id;
-  const lines = [`*Extra #${id}: ${clipped(summary.title, 200)}*`, `*Client:* ${clipped(summary.client || '—', 150)}`,
+  const lines = [`*${clipped(summary.title, 200)}*`, `*Client:* ${clipped(summary.client || '—', 150)}`,
     `*Description:* ${clipped(summary.description, 1000)}`, `*Requested by:* <@${summary.marketer_slack_user_id}>`,
     `*Status:* ${statusLabel(summary.status)} · *Effort round:* ${summary.effort_round} · *Delivery round:* ${summary.delivery_round}`];
   const contentDelivery = summary.departments.find(d => d.department_key.toLowerCase() === 'content')?.estimated_delivery_at;
   for (const d of summary.departments) {
-    const effort = d.effort_minutes == null ? 'pending effort' : `${d.effort_input_value} ${d.effort_input_unit} (${d.effort_minutes} min)`;
+    const effort = hasEffort(d) ? clipped(effortText(d), 300) : 'pending effort';
     const delivery = d.estimated_delivery_at ? (contentDelivery && d.department_key.toLowerCase() !== 'content'
       ? ` · delivery window ${formatCairo(contentDelivery)} → ${formatCairo(d.estimated_delivery_at)}`
       : ` · delivery ${formatCairo(d.estimated_delivery_at)}`) : '';
@@ -161,7 +165,7 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
   }
   for (const d of summary.departments) {
     const own = d.assignee_slack_user_id === actor;
-    if (own && summary.status === 'COLLECTING_EFFORT') buttons.push(action(`${d.effort_minutes == null ? 'Submit' : 'Update'} effort: ${d.department_key}`,
+    if (own && summary.status === 'COLLECTING_EFFORT') buttons.push(action(`${hasEffort(d) ? 'Update' : 'Submit'} effort: ${d.department_key}`,
       'extra_open_form', id, { kind: 'effort', department: d.department_key }));
     if (own && deliveryOpen && (d.department_key.toLowerCase() === 'content' || !summary.departments.some(x => x.department_key.toLowerCase() === 'content' && !x.estimated_delivery_at))) {
       buttons.push(action(`Delivery: ${d.department_key}`, 'extra_open_form', id, { kind: 'delivery', department: d.department_key }));
@@ -175,7 +179,7 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
         { kind: p.kind === 'EFFORT' ? 'counter_effort' : 'counter_delivery', proposalId: p.id, department: d.department_key }));
     }
   }
-  if (marketer && effortOpen && summary.departments.every(d => d.effort_minutes != null) && !summary.pendingProposals.some(p => p.kind === 'EFFORT')) {
+  if (marketer && effortOpen && summary.departments.every(hasEffort) && !summary.pendingProposals.some(p => p.kind === 'EFFORT')) {
     buttons.push(action('Send to CEO', 'extra_lock', id, {}, 'primary'));
     buttons.push(action('Re-request estimates', 'extra_open_form', id, { kind: 'rerequest_effort' }));
   }
@@ -195,17 +199,88 @@ export function summaryMessage(summary, actor, ceoId, configuredDepartments) {
     buttons.push(action('Approve', 'extra_open_form', id, { kind: 'ceo_decision', decision: 'APPROVE', approvalId: summary.latestApproval.id }, 'primary'));
     buttons.push(action('Reject', 'extra_open_form', id, { kind: 'ceo_decision', decision: 'REJECT', approvalId: summary.latestApproval.id }, 'danger'));
   }
-  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(buttons)];
-  return { text: `Extra #${id}: ${summary.title} — ${summary.status}`, blocks };
+  const uniqueButtons = buttons.map((element, index) => ({ ...element, action_id: `${element.action_id}:${index}` }));
+  const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(uniqueButtons)];
+  return { text: `${summary.title} — ${statusLabel(summary.status)}`, blocks };
 }
 
 export function requestView(summary, actor, ceoId, configuredDepartments) {
-  let actionIndex = 0;
-  const blocks = summaryMessage(summary, actor, ceoId, configuredDepartments).blocks.map(block =>
-    block.type === 'actions' ? { ...block, elements: block.elements.map(element =>
-      ({ ...element, action_id: `${element.action_id}:${actionIndex++}` })) } : block);
-  return { type: 'modal', callback_id: 'extra_request', title: plain(`Extra #${summary.id}`.slice(0, 24)),
+  const blocks = summaryMessage(summary, actor, ceoId, configuredDepartments).blocks;
+  return { type: 'modal', callback_id: 'extra_request', title: plain(summary.title.slice(0, 24)),
     close: plain('Close'), blocks };
+}
+
+export function createdView(summary) {
+  return { type: 'modal', callback_id: 'extra_created', title: plain('Request sent'), close: plain('Done'),
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text:
+      `*${clipped(summary.title, 180)}* was sent. Assigned teams have been asked for their effort estimates.` } }] };
+}
+
+export function cardMessage(summary, card, ceoId, configuredDepartments) {
+  const actor = card.recipient_slack_user_id;
+  if (card.kind === 'MARKETER' || card.kind === 'MARKETER_PROGRESS') {
+    return summaryMessage(summary, actor, ceoId, configuredDepartments);
+  }
+  if (card.kind.startsWith('CEO:')) {
+    const message = summaryMessage(summary, actor, ceoId, configuredDepartments);
+    if (Number(card.kind.slice(4)) !== summary.latestApproval?.id) {
+      return { ...message, blocks: message.blocks.filter(block => block.type !== 'actions') };
+    }
+    return message;
+  }
+  const [phase, rawRound] = card.kind.split(':');
+  if (phase !== 'EFFORT' && phase !== 'DELIVERY') return summaryMessage(summary, actor, ceoId, configuredDepartments);
+  const round = Number(rawRound);
+  const assigned = JSON.parse(card.departments_json || '[]');
+  const rows = summary.departments.filter(d => assigned.includes(d.department_key));
+  const isEffort = phase === 'EFFORT';
+  const currentRound = isEffort ? summary.effort_round : summary.delivery_round;
+  const active = round === currentRound && (isEffort ? summary.status === 'COLLECTING_EFFORT' : summary.status === 'COLLECTING_DELIVERY');
+  const lines = [`*${clipped(summary.title, 180)}*`, `*Client:* ${clipped(summary.client || '—', 120)}`,
+    `*Description:* ${clipped(summary.description, 900)}`, `*Requested by:* <@${summary.marketer_slack_user_id}>`,
+    `*${isEffort ? 'Effort estimate' : 'Delivery date'} · round ${round}*`];
+  if (card.note) lines.push(`*Marketer note:* ${clipped(card.note, 500)}`);
+  if (round !== currentRound) lines.push('This round is complete. See the latest request for current actions.');
+  else lines.push(`*Status:* ${statusLabel(summary.status)}`);
+  const content = summary.departments.find(d => d.department_key.toLowerCase() === 'content');
+  const buttons = [];
+  for (const d of rows) {
+    if (d.assignee_slack_user_id !== actor) continue;
+    lines.push(`• *${clipped(d.department_key)}:* ${isEffort
+      ? hasEffort(d) ? clipped(effortText(d), 300) : 'pending'
+      : d.estimated_delivery_at ? formatCairo(d.estimated_delivery_at) : 'pending'}`);
+    if (isEffort && d.effort_note) lines.push(`  Note: ${clipped(d.effort_note, 250)}`);
+    if (!isEffort && d.delivery_note) lines.push(`  Note: ${clipped(d.delivery_note, 250)}`);
+    if (active && (isEffort || d.department_key.toLowerCase() === 'content' || !content || content.estimated_delivery_at)) {
+      buttons.push(action(isEffort ? `${hasEffort(d) ? 'Edit' : 'Submit'} ${d.department_key} effort`
+        : `${d.estimated_delivery_at ? 'Edit' : 'Submit'} ${d.department_key} date`,
+      `extra_open_form:${buttons.length}`, summary.id, { kind: isEffort ? 'effort' : 'delivery',
+        department: d.department_key, round, roundType: isEffort ? 'effort' : 'delivery' }, 'primary'));
+    }
+  }
+  if (!isEffort && content?.estimated_delivery_at && !assigned.some(name => name.toLowerCase() === 'content')) {
+    lines.push(`*Content delivery:* ${formatCairo(content.estimated_delivery_at)}. Choose a date on or after this.`);
+  }
+  buttons.push(button('View current request', 'extra_view', { requestId: summary.id }));
+  return { text: `${summary.title} · ${isEffort ? 'effort' : 'delivery'} round ${round}`,
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(buttons)] };
+}
+
+export function shortAlert(event, summary, payload = {}) {
+  const title = clipped(summary.title, 180);
+  const department = clipped(payload.department || 'Team', 80);
+  const messages = {
+    EFFORT_SUBMITTED: `🔴 ${department} ${payload.revised ? 'updated its estimate' : 'replied'} · ${title}`,
+    DELIVERY_SUBMITTED: `🔴 ${department} ${payload.revised ? 'updated its date' : 'replied'} · ${title}`,
+    ALL_EFFORTS_COLLECTED: `✅ Estimates ready · ${title}`,
+    ALL_DELIVERY_ESTIMATES_COLLECTED: `✅ Delivery dates ready · ${title}`,
+    CEO_APPROVED: `✅ CEO approved · ${title}`,
+    CEO_REJECTED: `❌ CEO rejected · ${title}`,
+    FINAL_DELIVERY_APPROVED: `🚀 Approved to start · ${title}`,
+    EFFORT_REMINDER: `⏰ Effort estimate still needed · ${title}`,
+    QUESTION_ADDED: `💬 New note · ${title}`
+  };
+  return { text: messages[event] || `🔔 ${clipped(event, 80)} · ${title}` };
 }
 
 const eventTitles = {
@@ -225,19 +300,19 @@ export function notificationMessage(notification, summary) {
   const p = notification.payload;
   const event = notification.event_type;
   const round = p.round ?? (event.includes('DELIVERY') ? summary.delivery_round : summary.effort_round);
-  const lines = [`*Extra #${summary.id} · ${event.includes('DELIVERY') ? 'delivery' : 'effort'} round ${round}*`,
-    `*${eventTitles[event] || event}*`, `*Title:* ${clipped(summary.title, 150)}`,
+  const lines = [`*${clipped(summary.title, 150)} · ${event.includes('DELIVERY') ? 'delivery' : 'effort'} round ${round}*`,
+    `*${eventTitles[event] || event}*`,
     `*Client:* ${clipped(summary.client || '—', 120)}`, `*Description:* ${clipped(summary.description, 500)}`,
     `*Requested by:* <@${summary.marketer_slack_user_id}>`, `*Status:* ${statusLabel(summary.status)}`];
   if (p.department) lines.push(`Department: ${clipped(p.department, 80)}`);
   if (p.assigneeId) lines.push(`Submitted by: <@${p.assigneeId}>`);
-  if (p.effortValue != null) lines.push(`*Effort:* ${p.effortValue} ${p.effortUnit}`);
+  if (p.effortText != null) lines.push(`*Effort:* ${clipped(p.effortText, 300)}`);
   if (p.deliveryAt) lines.push(`*Delivery date:* ${formatCairo(p.deliveryAt)}`);
   if (p.note) lines.push(`Note: ${clipped(p.note, 700)}`);
   if (p.finalDeliveryAt) lines.push(`Final delivery: ${formatCairo(p.finalDeliveryAt)}`);
   if (p.contentDeliveryAt) lines.push(`Content delivery: ${formatCairo(p.contentDeliveryAt)}. Choose a date on or after this.`);
   if (event === 'EFFORT_SUBMITTED') {
-    const pending = p.pendingDepartments ?? summary.departments.filter(d => d.effort_minutes == null).map(d => ({ department: d.department_key, assigneeId: d.assignee_slack_user_id }));
+    const pending = p.pendingDepartments ?? summary.departments.filter(d => !hasEffort(d)).map(d => ({ department: d.department_key, assigneeId: d.assignee_slack_user_id }));
     lines.push(`*Still pending:* ${pending.length ? pending.map(d => `${clipped(d.department)} <@${d.assigneeId}>`).join(', ') : 'None'}`);
   }
   if (event === 'DELIVERY_SUBMITTED') {
@@ -246,9 +321,9 @@ export function notificationMessage(notification, summary) {
   }
   if (event === 'ALL_EFFORTS_COLLECTED' || event === 'CEO_APPROVAL_REQUESTED') {
     const estimates = p.estimates ?? p.snapshot?.departments.map(d => ({ department: d.department,
-      value: d.effortInputValue, unit: d.effortInputUnit, note: d.effortNote })) ?? summary.departments.map(d => ({ department: d.department_key,
-      value: d.effort_input_value, unit: d.effort_input_unit, note: d.effort_note }));
-    for (const d of estimates) lines.push(`• ${clipped(d.department)}: ${d.value ?? 'pending'} ${d.unit ?? ''}${d.note ? ` · ${clipped(d.note, 140)}` : ''}`);
+      text: d.effortText ?? (d.effortInputValue == null ? null : `${d.effortInputValue} ${d.effortInputUnit}`), note: d.effortNote })) ?? summary.departments.map(d => ({ department: d.department_key,
+      text: effortText(d), note: d.effort_note }));
+    for (const d of estimates) lines.push(`• ${clipped(d.department)}: ${clipped(d.text ?? (d.value == null ? 'pending' : `${d.value} ${d.unit ?? ''}`), 300)}${d.note ? ` · ${clipped(d.note, 140)}` : ''}`);
   }
   if (event === 'ALL_DELIVERY_ESTIMATES_COLLECTED') {
     const dates = p.dates ?? summary.departments.map(d => ({ department: d.department_key, deliveryAt: d.estimated_delivery_at }));
@@ -283,7 +358,7 @@ export function notificationMessage(notification, summary) {
     'ALL_DELIVERY_ESTIMATES_COLLECTED'].includes(event)) {
     actions.push(button('View current request', 'extra_view', { requestId: id }));
   }
-  return { text: `${eventTitles[event] || event} — Extra #${id} · round ${round}`,
+  return { text: `${eventTitles[event] || event} — ${summary.title} · round ${round}`,
     blocks: [{ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 2900) } }, ...actionBlocks(actions)] };
 }
 
